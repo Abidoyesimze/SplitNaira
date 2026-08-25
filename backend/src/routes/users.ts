@@ -5,7 +5,6 @@ import { User } from "../entities/User.js";
 import {
   userRegistrationSchema,
   stellarAddressSchema,
-  userUpdateSchema,
 } from "../schemas/user.schemas.js";
 import { AppError, ErrorCode, ErrorType } from "../lib/errors.js";
 import { logger } from "../services/logger.js";
@@ -23,14 +22,14 @@ export const usersRouter = Router();
  */
 usersRouter.post("/register", async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { walletAddress, email, alias } = userRegistrationSchema.parse(req.body);
+    const { walletAddress, email, alias, role } = userRegistrationSchema.parse(req.body);
 
     // Get repository without opening a transaction
     const dataSource = getDataSource();
     const userRepository = dataSource.getRepository(User);
 
     // Lightweight existence check before starting a transaction
-    const walletExists = await userRepository.exist({
+    const walletExists = await userRepository.exists({
       where: { walletAddress },
     });
 
@@ -49,7 +48,7 @@ usersRouter.post("/register", async (req: Request, res: Response, next: NextFunc
         walletAddress,
         email,
         alias,
-        role: "user",
+        role,
         isActive: true,
       });
 
@@ -135,7 +134,7 @@ usersRouter.post("/login", async (req: Request, res: Response, next: NextFunctio
  */
 usersRouter.get("/me", authJwtMiddleware, async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { walletAddress } = (req as any).user;
+    const { walletAddress } = req.user!;
     const userRepository = getDataSource().getRepository(User);
     const user = await userRepository.findOne({ where: { walletAddress } });
     if (!user) {

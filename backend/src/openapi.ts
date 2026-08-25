@@ -53,7 +53,6 @@ const registry = new OpenAPIRegistry();
 const EXAMPLE_OWNER = "GBJRKIYXAAFD3NZCWJXGUTNKYUQFZC2ANS6LRMBPJCE4IZSMJJMZPQBT";
 const EXAMPLE_COLLAB_A = "GCZTK3PNYXCVF7Z3ELVELEJZ7BVGPGPVJ3NVZNI7O6DVCHPA4JU6LXRV";
 const EXAMPLE_COLLAB_B = "GBG234UA6RBPDD5K6FHMQXHUXB5ALOENQGH24Y3W4ERX2YJNQ4MK4V25";
-const EXAMPLE_ADMIN = "GCJIQR7K2ZNIBXKFYHC6YMGD7CX46X3LAUBZAMQSMFB3XPHDY6YAT5GC";
 const EXAMPLE_TOKEN = "CDOVDY3MZDG7PHCGVP7EP2EKQ2ENV26DZW6FKLBRN42LOGIZGXZV3WX5";
 const EXAMPLE_CONTRACT_ID = "CAGR5U5IBEPFVJDZPZUXXNCPXAHNZ6TWVIUTI5RLRH3SZSU4O2VXDOPF";
 const EXAMPLE_PROJECT_ID = "afrobeats_001";
@@ -118,10 +117,15 @@ function standardErrorResponses(options: {
   badRequest?: boolean;
   badRequestExample?: Record<string, unknown>;
   unauthorized?: boolean;
+  forbidden?: boolean;
   notFound?: boolean;
   conflict?: boolean;
+  conflictExample?: Record<string, unknown>;
+  rateLimited?: boolean;
   serverError?: boolean;
+  serverErrorExample?: Record<string, unknown>;
   badGateway?: boolean;
+  badGatewayExample?: Record<string, unknown>;
   unavailable?: boolean;
 } = {}) {
   const responses: Record<number, ReturnType<typeof apiErrorResponse>> = {};
@@ -135,6 +139,13 @@ function standardErrorResponses(options: {
       requestId: EXAMPLE_REQUEST_ID,
     });
   }
+  if (options.forbidden) {
+    responses[403] = apiErrorResponse("Access denied", {
+      error: "FORBIDDEN",
+      message: "You do not have permission to perform this action.",
+      requestId: EXAMPLE_REQUEST_ID,
+    });
+  }
   if (options.notFound) {
     responses[404] = apiErrorResponse("Resource not found", {
       error: "NOT_FOUND",
@@ -142,10 +153,41 @@ function standardErrorResponses(options: {
       requestId: EXAMPLE_REQUEST_ID,
     });
   }
-  if (options.conflict) responses[409] = apiErrorResponse("Conflict with existing resource");
-  if (options.serverError) responses[500] = apiErrorResponse("Internal server error");
-  if (options.badGateway) responses[502] = apiErrorResponse("Upstream RPC or contract error");
-  if (options.unavailable) responses[503] = apiErrorResponse("Service temporarily unavailable");
+  if (options.conflict) {
+    responses[409] = apiErrorResponse("Conflict with existing resource", options.conflictExample ?? {
+      error: "CONFLICT",
+      message: `A project with ID "${EXAMPLE_PROJECT_ID}" already exists.`,
+      requestId: EXAMPLE_REQUEST_ID,
+    });
+  }
+  if (options.rateLimited) {
+    responses[429] = apiErrorResponse("Too many requests", {
+      error: "RATE_LIMIT_EXCEEDED",
+      message: "Too many requests. Please retry after the rate limit window.",
+      requestId: EXAMPLE_REQUEST_ID,
+    });
+  }
+  if (options.serverError) {
+    responses[500] = apiErrorResponse("Internal server error", options.serverErrorExample ?? {
+      error: "INTERNAL_ERROR",
+      message: "An unexpected error occurred. Please try again later.",
+      requestId: EXAMPLE_REQUEST_ID,
+    });
+  }
+  if (options.badGateway) {
+    responses[502] = apiErrorResponse("Upstream RPC or contract error", options.badGatewayExample ?? {
+      error: "BAD_GATEWAY",
+      message: "The Stellar network RPC call failed. Please retry.",
+      requestId: EXAMPLE_REQUEST_ID,
+    });
+  }
+  if (options.unavailable) {
+    responses[503] = apiErrorResponse("Service temporarily unavailable", {
+      error: "SERVICE_UNAVAILABLE",
+      message: "The service is temporarily unavailable. Please try again shortly.",
+      requestId: EXAMPLE_REQUEST_ID,
+    });
+  }
   return responses;
 }
 
@@ -178,6 +220,24 @@ const ProjectSchema = registry.register(
     ),
   })
 );
+
+const idempotencyKeyHeaderSchema = z.object({
+  "Idempotency-Key": z
+    .string()
+    .min(1)
+    .max(255)
+    .regex(/^[A-Za-z0-9_.:-]+$/)
+    .optional()
+    .openapi({
+      example: "550e8400-e29b-41d4-a716-446655440000",
+      description:
+        "Client-generated unique token identifying this create-split request (Issue #888). " +
+        "Replaying the same key with an identical payload returns the original response " +
+        "instead of resubmitting; replaying it with a different payload returns 409 " +
+        "IDEMPOTENCY_KEY_CONFLICT. Keys expire after IDEMPOTENCY_KEY_TTL_MS (default 24h), " +
+        "after which the request is treated as new.",
+    }),
+});
 
 const XdrResponseSchema = registry.register(
   "XdrResponse",
@@ -212,7 +272,7 @@ registry.registerPath({
         },
       },
     },
-    ...standardErrorResponses({ badRequest: true, badGateway: true, serverError: true }),
+    ...standardErrorResponses({ badRequest: true, rateLimited: true, badGateway: true, serverError: true }),
   },
 });
 
@@ -223,9 +283,11 @@ registry.registerPath({
   description:
     "Builds an unsigned Soroban transaction XDR to create a new revenue-split project on-chain. " +
     "The caller must sign the returned XDR with the `owner` wallet and submit it themselves; " +
-    "this endpoint never holds a private key.",
+    "this endpoint never holds a private key. Supports an optional `Idempotency-Key` header " +
+    "(Issue #888) so retried requests don't produce duplicate project-creation attempts.",
   tags: ["Splits"],
   request: {
+    headers: idempotencyKeyHeaderSchema,
     body: {
       content: {
         "application/json": {
@@ -257,6 +319,13 @@ registry.registerPath({
     },
     ...standardErrorResponses({
       badRequest: true,
+      conflict: true,
+      conflictExample: {
+        error: "IDEMPOTENCY_KEY_CONFLICT",
+        code: "IDEMPOTENCY_KEY_CONFLICT",
+        message: "Idempotency-Key was already used with a different request payload.",
+        requestId: EXAMPLE_REQUEST_ID,
+      },
       badGateway: true,
       serverError: true,
       badRequestExample: {
@@ -741,7 +810,7 @@ registry.registerPath({
         },
       },
     },
-    ...standardErrorResponses({ badRequest: true, unauthorized: true, badGateway: true, serverError: true }),
+    ...standardErrorResponses({ badRequest: true, unauthorized: true, forbidden: true, badGateway: true, serverError: true }),
   },
 });
 
@@ -757,7 +826,7 @@ registry.registerPath({
   },
   responses: {
     200: { description: "Unsigned transaction XDR", content: { "application/json": { schema: XdrResponseSchema } } },
-    ...standardErrorResponses({ badRequest: true, unauthorized: true, unavailable: true, badGateway: true, serverError: true }),
+    ...standardErrorResponses({ badRequest: true, unauthorized: true, forbidden: true, unavailable: true, badGateway: true, serverError: true }),
   },
 });
 
@@ -773,7 +842,7 @@ registry.registerPath({
   },
   responses: {
     200: { description: "Unsigned transaction XDR", content: { "application/json": { schema: XdrResponseSchema } } },
-    ...standardErrorResponses({ badRequest: true, unauthorized: true, unavailable: true, badGateway: true, serverError: true }),
+    ...standardErrorResponses({ badRequest: true, unauthorized: true, forbidden: true, unavailable: true, badGateway: true, serverError: true }),
   },
 });
 
@@ -789,7 +858,7 @@ registry.registerPath({
   },
   responses: {
     200: { description: "Unsigned transaction XDR", content: { "application/json": { schema: XdrResponseSchema } } },
-    ...standardErrorResponses({ badRequest: true, unauthorized: true, unavailable: true, badGateway: true, serverError: true }),
+    ...standardErrorResponses({ badRequest: true, unauthorized: true, forbidden: true, unavailable: true, badGateway: true, serverError: true }),
   },
 });
 
@@ -805,7 +874,7 @@ registry.registerPath({
   },
   responses: {
     200: { description: "Unsigned transaction XDR", content: { "application/json": { schema: XdrResponseSchema } } },
-    ...standardErrorResponses({ badRequest: true, unauthorized: true, unavailable: true, badGateway: true, serverError: true }),
+    ...standardErrorResponses({ badRequest: true, unauthorized: true, forbidden: true, unavailable: true, badGateway: true, serverError: true }),
   },
 });
 
@@ -821,7 +890,7 @@ registry.registerPath({
       description: "Admin status",
       content: { "application/json": { schema: AdminStatusSchema } },
     },
-    ...standardErrorResponses({ unauthorized: true, badGateway: true, serverError: true }),
+    ...standardErrorResponses({ unauthorized: true, forbidden: true, badGateway: true, serverError: true }),
   },
 });
 
@@ -842,7 +911,7 @@ registry.registerPath({
         },
       },
     },
-    ...standardErrorResponses({ badRequest: true, unauthorized: true, badGateway: true, serverError: true }),
+    ...standardErrorResponses({ badRequest: true, unauthorized: true, forbidden: true, badGateway: true, serverError: true }),
   },
 });
 
@@ -862,7 +931,7 @@ registry.registerPath({
         },
       },
     },
-    ...standardErrorResponses({ unauthorized: true, badGateway: true, serverError: true }),
+    ...standardErrorResponses({ unauthorized: true, forbidden: true, badGateway: true, serverError: true }),
   },
 });
 
@@ -883,7 +952,7 @@ registry.registerPath({
         },
       },
     },
-    ...standardErrorResponses({ badRequest: true, unauthorized: true, badGateway: true, serverError: true }),
+    ...standardErrorResponses({ badRequest: true, unauthorized: true, forbidden: true, badGateway: true, serverError: true }),
   },
 });
 
@@ -1102,23 +1171,75 @@ registry.registerPath({
 
 // ─── Health Endpoints ─────────────────────────────────────────────────────────
 
-const HealthResponseSchema = registry.register(
+registry.register(
   "HealthResponse",
   z.object({
-    status: z.enum(["ok", "not_ready"]),
+    status: z.enum(["ok", "degraded", "not_ready"]),
     uptime: z.number().optional().describe("Server uptime in seconds"),
     timestamp: z.string().optional().describe("ISO 8601 timestamp"),
+  })
+);
+
+// Issue #935: per-dependency 3-way status. A dependency is "up" if it
+// responds within its configured latency threshold, "degraded" if it
+// responds successfully but slower than that threshold, and "down" if it
+// errors or times out outright. Thresholds are configurable via
+// HEALTH_DB_DEGRADED_LATENCY_MS (default 500ms) and
+// HEALTH_RPC_DEGRADED_LATENCY_MS (default 1500ms, applied to both the
+// Soroban RPC and contract-simulation checks).
+const ComponentHealthSchema = registry.register(
+  "ComponentHealth",
+  z.object({
+    status: z.enum(["up", "degraded", "down"]),
+    latencyMs: z.number().optional().describe("Round-trip latency of the underlying check, in milliseconds"),
+    message: z
+      .string()
+      .optional()
+      .describe("Redacted, human-readable detail. Never contains secrets or raw connection strings."),
+  })
+);
+
+const EnvComponentHealthSchema = registry.register(
+  "EnvComponentHealth",
+  z.object({
+    ok: z.boolean().describe("Whether required environment variables are present and valid"),
+  })
+);
+
+const EventListenerComponentHealthSchema = registry.register(
+  "EventListenerComponentHealth",
+  z.object({
+    status: z.enum(["stopped", "healthy", "degraded"]),
+    lastSuccessfulPoll: z.string().nullable().describe("ISO 8601 timestamp of the last successful poll, or null"),
+    consecutiveErrors: z.number().int().describe("Number of consecutive failing polls"),
+  })
+);
+
+const ReadinessComponentsSchema = registry.register(
+  "ReadinessComponents",
+  z.object({
+    env: EnvComponentHealthSchema,
+    db: ComponentHealthSchema,
+    rpc: ComponentHealthSchema,
+    contract: ComponentHealthSchema,
+    eventListener: EventListenerComponentHealthSchema.optional(),
   })
 );
 
 const ReadinessResponseSchema = registry.register(
   "ReadinessResponse",
   z.object({
-    status: z.enum(["ready", "not_ready"]),
+    status: z.enum(["ready", "degraded", "not_ready"]).describe(
+      "Issue #935 status/status-code policy: \"ready\" -> 200 (all dependencies up); " +
+      "\"degraded\" -> 200 (service still usable, but at least one dependency is slow " +
+      "or in a non-fatal failure state - investigate, don't page); \"not_ready\" -> 503 " +
+      "(env invalid or a dependency is fully down, unchanged from the legacy binary contract)."
+    ),
     error: z.string().optional().describe("Error code if not ready"),
     message: z.string().optional().describe("Error message if not ready"),
     issues: z.array(z.string()).optional().describe("List of configuration issues"),
     requestId: z.string().optional().describe("Request ID for tracing"),
+    components: ReadinessComponentsSchema.optional(),
   })
 );
 
@@ -1126,10 +1247,13 @@ registry.registerPath({
   method: "get",
   path: "/health",
   summary: "Get readiness status (alias for /health/ready)",
+  description:
+    "Alias for /health/ready. Returns 200 for both \"ready\" and \"degraded\" (service still usable); " +
+    "503 only for \"not_ready\" (Issue #935).",
   tags: ["Health"],
   responses: {
     200: {
-      description: "Server is ready to accept traffic",
+      description: "Server is ready to accept traffic, or degraded but still usable",
       content: {
         "application/json": {
           schema: ReadinessResponseSchema,
@@ -1170,20 +1294,23 @@ registry.registerPath({
   method: "get",
   path: "/health/ready",
   summary: "Readiness check (Kubernetes compatible)",
+  description:
+    "Issue #935: returns 200 with status \"ready\" (all dependencies up) or \"degraded\" " +
+    "(usable, but db/rpc/contract/eventListener is slow or non-fatally impaired); " +
+    "returns 503 with status \"not_ready\" only when env is invalid or a dependency is " +
+    "fully down. See docs/runbooks/observability.md for the on-call interpretation of each state.",
   tags: ["Health"],
   responses: {
     200: {
-      description: "Server is ready to accept traffic",
+      description: "Server is ready to accept traffic, or degraded but still usable",
       content: {
         "application/json": {
-          schema: z.object({
-            status: z.literal("ready"),
-          }),
+          schema: ReadinessResponseSchema,
         },
       },
     },
     503: {
-      description: "Server is not ready (missing configuration)",
+      description: "Server is not ready (missing configuration or a dependency is down)",
       content: {
         "application/json": {
           schema: ReadinessResponseSchema,
@@ -1200,22 +1327,22 @@ const MainnetReadinessResponseSchema = registry.register(
     requestId: z.string().optional(),
     error: z.string().optional(),
     message: z.string().optional(),
-    details: z.record(z.any()).optional(),
+    details: z.record(z.string(), z.any()).optional(),
     components: z.object({
       env: z.object({
         ok: z.boolean(),
         message: z.string().optional(),
-        details: z.record(z.any()).optional()
+        details: z.record(z.string(), z.any()).optional()
       }),
       db: z.object({
         ok: z.boolean(),
         message: z.string().optional(),
-        details: z.record(z.any()).optional()
+        details: z.record(z.string(), z.any()).optional()
       }),
       cache: z.object({
         ok: z.boolean(),
         message: z.string().optional(),
-        details: z.record(z.any()).optional()
+        details: z.record(z.string(), z.any()).optional()
       }),
       deploy: z.object({
         ok: z.boolean(),
@@ -1281,6 +1408,19 @@ registry.registerPath({
   },
 });
 
+registry.registerComponent("securitySchemes", "bearerAuth", {
+  type: "http",
+  scheme: "bearer",
+  bearerFormat: "JWT",
+  description: "JWT obtained from POST /users/login",
+});
+
+registry.registerComponent("securitySchemes", "adminApiKey", {
+  type: "apiKey",
+  in: "header",
+  name: "x-admin-api-key",
+  description: "Payments admin API key for /splits/admin mutation endpoints",
+});
 // ─── Generation ───────────────────────────────────────────────────────────────
 
 export function generateOpenApi() {
@@ -1294,22 +1434,6 @@ export function generateOpenApi() {
       description: "Premium royalty management API on Stellar network.",
     },
     servers: [{ url: "http://localhost:3001" }],
-    components: {
-      securitySchemes: {
-        bearerAuth: {
-          type: "http",
-          scheme: "bearer",
-          bearerFormat: "JWT",
-          description: "JWT obtained from POST /users/login",
-        },
-        adminApiKey: {
-          type: "apiKey",
-          in: "header",
-          name: "x-admin-api-key",
-          description: "Payments admin API key for /splits/admin mutation endpoints",
-        },
-      },
-    },
   });
 }
 
@@ -1323,13 +1447,15 @@ const isDirectRun = process.argv[1] && (
 
 if (isDirectRun) {
   const spec = generateOpenApi();
-  const docsDir = path.join(path.dirname(__filename), "..", "..", "docs");
+  // Allow CI drift-check scripts to redirect output to a temp path by
+  // setting OPENAPI_OUTPUT_DIR. Falls back to the standard docs/ location.
+  const docsDir = process.env.OPENAPI_OUTPUT_DIR
+    ? path.resolve(process.env.OPENAPI_OUTPUT_DIR)
+    : path.join(path.dirname(__filename), "..", "..", "docs");
   if (!fs.existsSync(docsDir)) {
     fs.mkdirSync(docsDir, { recursive: true });
   }
-  fs.writeFileSync(
-    path.join(docsDir, "openapi.yaml"),
-    yaml.stringify(spec)
-  );
-  logger.info("OpenAPI spec generated at docs/openapi.yaml");
+  const outputPath = path.join(docsDir, "openapi.yaml");
+  fs.writeFileSync(outputPath, yaml.stringify(spec));
+  logger.info(`OpenAPI spec generated at ${outputPath}`);
 }

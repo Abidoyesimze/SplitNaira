@@ -38,6 +38,12 @@ mod tests;
 mod hardening_tests;
 #[cfg(test)]
 mod reliability_tests;
+#[cfg(test)]
+mod authorization_tests;
+#[cfg(test)]
+mod address_validation_tests;
+#[cfg(test)]
+mod ttl_renewal_tests;
 
 use errors::SplitError;
 

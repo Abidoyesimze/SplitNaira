@@ -5,6 +5,7 @@ import { User } from "../entities/User.js";
 import { TransactionRecord } from "../entities/Transaction.js";
 import { ServiceState } from "../entities/ServiceState.js";
 import { AuditLog } from "../entities/AuditLog.js";
+import { LedgerBlock } from "../entities/LedgerBlock.js";
 import { logger } from "./logger.js";
 
 let AppDataSource: DataSource | null = null;
@@ -34,7 +35,7 @@ export function createDataSource(): DataSource {
     url: databaseUrl,
     synchronize: false,
     logging: process.env.NODE_ENV === "development",
-    entities: [User, TransactionRecord, ServiceState, AuditLog],
+    entities: [User, TransactionRecord, ServiceState, AuditLog, LedgerBlock],
     migrations: ["src/migrations/*.ts"],
     migrationsTableName: "migrations",
     extra: {
@@ -68,6 +69,14 @@ export async function initDatabase(): Promise<DataSource> {
   return initializationPromise;
 }
 
+
+export function setDataSourceForTests(dataSource: DataSource | null): void {
+  if (process.env.NODE_ENV !== "test") {
+    throw new Error("setDataSourceForTests is only available in test mode.");
+  }
+  AppDataSource = dataSource;
+  initializationPromise = null;
+}
 export function getDataSource(): DataSource {
   if (!AppDataSource?.isInitialized) {
     throw new Error("Database not initialized. Call initDatabase() first.");
@@ -80,7 +89,12 @@ const DEADLOCK_MAX_RETRIES = 3;
 const DEADLOCK_RETRY_DELAY_MS = 50;
 
 function isDeadlockError(error: unknown): boolean {
-  return (error as any)?.code === DEADLOCK_ERROR_CODE;
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    error.code === DEADLOCK_ERROR_CODE
+  );
 }
 
 function sleep(ms: number): Promise<void> {
@@ -93,18 +107,6 @@ function sleep(ms: number): Promise<void> {
  * deadlock errors (error code 40P01).
  */
 
-function isRetryableTransactionError(error: unknown): boolean {
-  return (
-    typeof error === "object" &&
-    error !== null &&
-    "code" in error &&
-    (error.code === "40001" || error.code === "40P01")
-  );
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
 
 export async function withTransaction<T>(
   callback: (queryRunner: QueryRunner) => Promise<T>

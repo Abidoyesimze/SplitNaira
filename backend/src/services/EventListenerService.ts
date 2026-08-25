@@ -21,6 +21,10 @@ export const ERROR_THRESHOLD = 3;
 export const MAX_CATCHUP_LEDGERS = 10_000;
 const STARTUP_LOOKBACK_LEDGERS = 100;
 
+// Key under which the polling cursor is persisted in ServiceState so it
+// survives process restarts.
+export const EVENT_LISTENER_CURSOR_KEY = "event_listener_cursor";
+
 export type ServiceStatus = "stopped" | "healthy" | "degraded";
 
 let pollInterval: NodeJS.Timeout | null = null;
@@ -85,7 +89,20 @@ export async function startEventListenerService() {
 
   try {
     const server = getStellarRpcServer();
-    const latestLedger = await executeWithRetry(() => server.getLatestLedger());
+    const stateRepo = getDataSource().getRepository(ServiceState);
+    const persistedCursor = await stateRepo.findOneBy({ key: EVENT_LISTENER_CURSOR_KEY });
+
+    if (persistedCursor?.value) {
+      cursor = persistedCursor.value;
+      startLedger = null;
+      logger.info("Initialized EventListenerService from persisted cursor");
+      schedulePolling(NORMAL_POLL_INTERVAL_MS);
+      return;
+    }
+
+    const latestLedger = await executeWithRetry(() => server.getLatestLedger(), {
+      operation: "getLatestLedger"
+    });
 
     // Start polling from a small lookback to cover restart gaps, but never more
     // than MAX_CATCHUP_LEDGERS behind the tip.
@@ -199,18 +216,11 @@ export async function pollEvents() {
       ? { filters, startLedger, limit: 100 }
       : { filters, cursor: "", limit: 100 };
 
-    const response = await executeWithRetry(() => server.getEvents(filterOptions));
+    const response = await executeWithRetry(() => server.getEvents(filterOptions), {
+      operation: "getEvents"
+    });
 
     const newRecords: TransactionRecord[] = [];
-    const ssePayloads: Array<{
-      txHash: string;
-      roundId: string;
-      recipient: string;
-      amount: string;
-      token: string;
-      timestamp: number;
-      status: "completed";
-    }> = [];
 
     for (const event of response?.events ?? []) {
       try {
@@ -222,67 +232,39 @@ export async function pollEvents() {
           }
         });
 
-        // Only index `payment_sent` events.
-        if (topics[0] !== "payment_sent") {
+        const eventName = topics[0] || "";
+        if (
+          eventName !== "payment_sent" &&
+          eventName !== "collaborator_claimed" &&
+          eventName !== "distribution_complete"
+        ) {
+          continue;
+        }
+        const projectId = topics[1] || "";
+        const txHash = event.txHash;
+        const timestamp = Math.floor(new Date(event.ledgerClosedAt).getTime() / 1000);
+
+        if (eventName === "distribution_complete") {
+          logger.info("Indexed milestone event", {
+            eventName,
+            projectId,
+            txHash,
+            ledgerClosedAt: event.ledgerClosedAt,
+          });
+          continue;
+        }
+        // Skip already-indexed transactions. The DB also enforces uniqueness
+        // on txHash, but this avoids redundant work during polling.
+        const decoded = scValToNative(event.value) as [string, string | number | bigint, number?];
+        const recipient = String(decoded[0]);
+        const amount = String(decoded[1]);
+
+        const existing = await repo.findOneBy({ txHash });
+        if (existing) {
           continue;
         }
 
-          // Only `payment_sent` events are indexed as transaction records.
-          if (topics[0] !== "payment_sent") {
-            continue;
-          }
-
-          const projectId = topics[1] || "";
-          const valueData = scValToNative(event.value) as [
-            string,
-            string | number | bigint
-          ];
-          const recipient = valueData[0];
-          const amount = String(valueData[1]);
-          const txHash = event.txHash;
-          const timestamp = Math.floor(
-            new Date(event.ledgerClosedAt).getTime() / 1000
-          );
-
-          // Only `payment_sent` events are indexed as transaction records.
-          if (topics[0] !== "payment_sent") {
-            continue;
-          }
-
-          const projectId = topics[1] || "";
-          const valueData = scValToNative(event.value) as [
-            string,
-            string | number | bigint
-          ];
-          const recipient = valueData[0];
-          const amount = String(valueData[1]);
-          const txHash = event.txHash;
-          const timestamp = Math.floor(
-            new Date(event.ledgerClosedAt).getTime() / 1000
-          );
-
-          // Skip already-indexed transactions. The DB also enforces uniqueness
-          // on txHash, but this avoids redundant work during polling.
-          const existing = await repo.findOneBy({ txHash });
-          if (existing) {
-            continue;
-          }
-
-          // Resolve the project's token address; fall back to "Native".
-          let token = "Native";
-          try {
-            const project = await fetchProjectById(projectId);
-            if (project && typeof project === "object" && "token" in project) {
-              token = String(project.token);
-            }
-          } catch (err) {
-            logger.warn(
-              `Could not resolve token address for project ${projectId}. Using fallback.`,
-              { err }
-            );
-          }
-
-        // Resolve the project's token address (best-effort; falls back to Native).
+        // Resolve the project's token address; fall back to "Native".
         let token = "Native";
         try {
           const project = await fetchProjectById(projectId);
@@ -294,21 +276,6 @@ export async function pollEvents() {
             `Could not resolve token address for project ${projectId}. Using fallback.`,
             { err }
           );
-
-          publishSseEvent(txHash, {
-            txHash,
-            roundId: projectId,
-            recipient,
-            amount,
-            token,
-            timestamp,
-            status: "completed",
-          });
-        } catch (eventError) {
-          logger.error("Error processing polled Soroban event", {
-            event,
-            error: eventError,
-          });
         }
 
         newRecords.push(
@@ -322,15 +289,6 @@ export async function pollEvents() {
             status: "completed",
           })
         );
-        ssePayloads.push({
-          txHash,
-          roundId: projectId,
-          recipient,
-          amount,
-          token,
-          timestamp,
-          status: "completed",
-        });
       } catch (eventError) {
         logger.error("Error processing polled Soroban event", {
           event,
@@ -368,7 +326,7 @@ export async function pollEvents() {
 
         // Real-time push: notify the generic event bus (Issue #618) and the
         // txHash-keyed SSE bus so connected clients are updated immediately.
-        for (const record of records) {
+        for (const record of newRecords) {
           getEventBus().emit(TRANSACTION_CONFIRMED, record);
           publishSseEvent(record.txHash, {
             txHash: record.txHash,
@@ -388,10 +346,6 @@ export async function pollEvents() {
       cursor = nextCursor;
       startLedger = null;
     }
-    for (const payload of ssePayloads) {
-      publishSseEvent(payload.txHash, payload);
-    }
-
     recordPollSuccess();
   } catch (error) {
     recordPollFailure(error);

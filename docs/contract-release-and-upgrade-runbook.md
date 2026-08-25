@@ -2,6 +2,10 @@
 
 This runbook describes the end-to-end release/upgrade path for the `contracts/` workspace in SplitNaira.
 
+## Contract Interface Changes
+- Before releasing any interface-affecting update, complete [CONTRACT_INTERFACE_RELEASE_CHECKLIST.md](./CONTRACT_INTERFACE_RELEASE_CHECKLIST.md).
+- Use the checklist to verify Rust/source updates, regenerated interface/types, OpenAPI alignment, docs/changelog updates, deployment metadata, and required CI commands.
+
 ## 1. Prerequisites
 - Rust toolchain 1.76+ (stable)
 - `cargo` installed and on PATH
@@ -89,6 +93,9 @@ Alternatively, trigger the smoke test via GitHub Actions without checking out lo
   - `distribution_complete`
 
 ## 7. Upgrade process
+
+Before starting an upgrade, complete the ADR for the upgrade: [docs/adr/0001-contract-upgrade-decision-record.md](../adr/0001-contract-upgrade-decision-record.md). The ADR must cover compatibility, storage migration, event schema impact, test evidence, and rollback plan before the release sign-off checklist is approved.
+
 1. New release path:
    - Build new WASM as above.
    - Deploy replacement contract to Soroban.

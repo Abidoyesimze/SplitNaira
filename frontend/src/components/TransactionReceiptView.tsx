@@ -9,9 +9,10 @@
  */
 "use client";
 
-import { useEffect } from "react";
+import { useEffect, type ReactElement } from "react";
 import { getExplorerUrl, getExplorerLabel } from "@/lib/stellar";
 import { useTransactionStatus } from "@/hooks/useTransactionStatus";
+import { CopyHashButton } from "./CopyHashButton";
 
 export type SorobanReceiptLifecycle =
   | "confirming"
@@ -87,7 +88,7 @@ const ACTION_COPY: Record<TransactionReceipt["action"], ActionCopy> = {
   },
 };
 
-const ICONS: Record<TransactionReceipt["action"], JSX.Element> = {
+const ICONS: Record<TransactionReceipt["action"], ReactElement> = {
   create: (
     <path
       strokeLinecap="round"
@@ -303,9 +304,12 @@ export function TransactionReceiptView({
             </div>
           )}
           <div className="pt-2 space-y-1">
-            <p className="font-mono text-[9px] text-muted break-all opacity-60">
-              Tx: {receipt.hash}
-            </p>
+            <div className="flex items-center gap-1">
+              <p className="font-mono text-[9px] text-muted break-all opacity-60">
+                Tx: {receipt.hash}
+              </p>
+              <CopyHashButton hash={receipt.hash} className="shrink-0" />
+            </div>
             {(isSuccess || isConfirming || isTimeout) && (
               <a
                 href={resolvedExplorerUrl}

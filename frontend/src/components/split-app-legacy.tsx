@@ -112,8 +112,15 @@ const SEEDED_PROJECT_IDS = [
 
 export function SplitApp({
   onLoadingFlagsChange,
+  isWriteDisabled = false,
 }: {
   onLoadingFlagsChange?: (flags: LoadingBarFlags) => void;
+  /**
+   * True when the backend is reporting maintenance mode (#934). Gates the
+   * "Execute Payout" distribution action as a demonstrative write-action
+   * lock — read-only flows (viewing projects, history, etc.) stay open.
+   */
+  isWriteDisabled?: boolean;
 } = {}) {
   const { wallet, connect, refresh } = useWallet();
 
@@ -141,6 +148,8 @@ export function SplitApp({
   const [txHash, setTxHash] = useState<string | null>(null);
   const [receipt, setReceipt] = useState<TransactionReceipt | null>(null);
   const [createdProject, setCreatedProject] = useState<SplitProject | null>(null);
+  const [createRetryError, setCreateRetryError] = useState<string | null>(null);
+  const [lastCreatePayload, setLastCreatePayload] = useState<CreateSplitFormValues | null>(null);
   const latestTxHash = txHash ?? receipt?.hash ?? null;
 
   const [activeTab, setActiveTab] = useState<"dashboard" | "create" | "manage" | "projects">("dashboard");
@@ -452,7 +461,6 @@ export function SplitApp({
       if (submitResponse.status === "ERROR")
         throw new Error(submitResponse.errorResult?.toString() ?? "Transaction failed.");
       notify.success("Project metadata updated successfully.");
-      void onFetchProject();
     } catch (error) {
       patchProjectInAllViews(projectId, previousSnapshot);
       setIsEditingMetadata(true);
@@ -507,6 +515,13 @@ export function SplitApp({
     setTxHash(null);
     setReceipt(null);
     setCreatedProject(null);
+    setCreateRetryError(null);
+    setLastCreatePayload(null);
+  }
+
+  function onRetryCreateSubmission() {
+    if (!lastCreatePayload || isSubmitting) return;
+    void onSubmit(lastCreatePayload);
   }
 
   function updateEditCollaborator(id: string, patch: Partial<CollaboratorInput>) {
@@ -544,6 +559,11 @@ export function SplitApp({
       basisPoints: Number.parseInt(collaborator.basisPoints, 10),
     }));
     setIsSubmitting(true);
+    setCreateRetryError(null);
+    setLastCreatePayload({
+      ...data,
+      collaborators: data.collaborators.map((c) => ({ ...c })),
+    });
     setTxHash(null);
     setReceipt(null);
     try {
@@ -579,6 +599,7 @@ export function SplitApp({
         prev?.action === "create" && prev.hash ? { ...prev, lifecycle: "success" } : prev,
       );
       notify.success("Split project created successfully.");
+      setCreateRetryError(null);
 
       try {
         const projectDetails = await getSplit(data.projectId.trim());
@@ -591,6 +612,10 @@ export function SplitApp({
     } catch (error) {
       const message =
         error instanceof Error ? error.message : "Failed to create split project.";
+      const isRetryable = /offline|network|fetch|timeout|temporar/i.test(message);
+      setCreateRetryError(
+        isRetryable ? message : "Submission failed. Verify your connection and retry.",
+      );
       setReceipt((prev) =>
         prev?.lifecycle === "confirming" && prev.action === "create"
           ? { ...prev, lifecycle: "failed", failureReason: message }
@@ -958,6 +983,13 @@ export function SplitApp({
     onLoadingFlagsChange,
   ]);
 
+  // Reload dashboard data when wallet account switches
+  useEffect(() => {
+    if (activeTab === "dashboard") {
+      void onFetchDashboardData();
+    }
+  }, [wallet.address]);
+
   useEffect(() => {
     if (activeTab === "projects") {
       if (projectsList.length === 0 && !isLoadingProjectsList) {
@@ -1140,6 +1172,8 @@ export function SplitApp({
             receipt={receipt}
             latestTxHash={latestTxHash}
             createdProject={createdProject}
+            createRetryError={createRetryError}
+            onRetryCreateSubmission={onRetryCreateSubmission}
             setActiveTab={setActiveTab}
             setSearchProjectId={setSearchProjectId}
             setFetchedProject={setFetchedProject}
@@ -1243,7 +1277,7 @@ export function SplitApp({
             <div className="mt-10 flex flex-col gap-4">
               <button
                 onClick={onDistribute}
-                disabled={sorobanSplitFlowBusy}
+                disabled={sorobanSplitFlowBusy || isWriteDisabled}
                 className="premium-button w-full rounded-2xl bg-greenBright py-5 text-xs font-black uppercase tracking-[0.3em] text-[#0a0a09]"
               >
                 {isSubmitting
@@ -1252,6 +1286,11 @@ export function SplitApp({
                     : "Signing & submitting…"
                   : "Execute Payout"}
               </button>
+              {isWriteDisabled && (
+                <p className="text-center text-[10px] font-bold uppercase tracking-widest text-red-400">
+                  Unavailable during maintenance
+                </p>
+              )}
               <button
                 onClick={() => setShowDistributeModal(false)}
                 disabled={sorobanSplitFlowBusy}
@@ -1497,4 +1536,3 @@ export function SplitApp({
     </main>
   );
 }
-

@@ -6,10 +6,10 @@ Operational guidance for metrics, health probes, correlation IDs, and deploy ver
 
 | Endpoint | Purpose | Expected |
 |----------|---------|----------|
-| `GET /health` | Basic status + uptime | `200`, `{ status: "ok" }` |
+| `GET /health` | Readiness alias | `200` (`ready`/`degraded`), `503` (`not_ready`) — see below |
 | `GET /health/live` | Liveness (process up) | `200`, `{ status: "ok" }` |
 | `GET /health/startup` | Initialisation complete | `200` after DB/listeners start; `503` during boot |
-| `GET /health/ready` | Ready for traffic | `200` when DB + Soroban RPC + contract sim OK |
+| `GET /health/ready` | Ready for traffic | `200` (`ready`/`degraded`), `503` (`not_ready`) — see below |
 
 Configure Render/orchestrator probes:
 
@@ -17,9 +17,60 @@ Configure Render/orchestrator probes:
 - **Readiness:** `/health/ready`
 - **Startup (optional):** `/health/startup`
 
+### Degraded-mode readiness contract (Issue #935)
+
+`/health` and `/health/ready` report a three-way `status` instead of a binary
+ready/not-ready, so orchestrators and the frontend can distinguish "fully
+healthy", "impaired but serving traffic", and "actually down":
+
+| `status` | HTTP code | Meaning | On-call action |
+|----------|-----------|---------|-----------------|
+| `ready` | `200` | Every dependency (`db`, `rpc`, `contract`, `eventListener`) is `up`/`healthy`. | None. |
+| `degraded` | `200` | The service is still usable — nothing is fully down — but at least one dependency is slow (past its latency threshold) or in a non-fatal failure state (e.g. the event listener backing off after RPC errors). | Investigate at normal priority; **do not page as an outage**. Traffic keeps flowing. |
+| `not_ready` | `503` | `env` config is invalid, or `db`/`rpc`/`contract` is fully unreachable/erroring. Unchanged from the legacy binary contract. | Page / treat as an outage, same as before. |
+
+Each of `components.db`, `components.rpc`, and `components.contract` in the
+response body now has the shape:
+
+```json
+{ "status": "up" | "degraded" | "down", "latencyMs": 123, "message": "query_ok" }
+```
+
+- **`up`**: responded successfully within its latency threshold.
+- **`degraded`**: responded successfully, but slower than its threshold.
+- **`down`**: errored or timed out outright (this is what drives `not_ready`/`503` — a dependency degrading to `"degraded"` never does).
+
+`components.env` stays a simple `{ ok: boolean }` — there's no natural
+"degraded" config state. `components.eventListener` keeps its existing
+`stopped`/`healthy`/`degraded` shape from `EventListenerService.getServiceHealth()`;
+an `eventListener.status === "degraded"` now also pulls the *overall*
+`status` down to `"degraded"` (previously it was reported informationally
+without affecting the top-level status).
+
+**Latency thresholds** (configurable, see `backend/.env.example`):
+
+| Env var | Default | Applies to |
+|---------|---------|------------|
+| `HEALTH_DB_DEGRADED_LATENCY_MS` | `500` | The `SELECT 1` readiness query |
+| `HEALTH_RPC_DEGRADED_LATENCY_MS` | `1500` | Both the Soroban RPC `getAccount` reachability call and the contract-simulation call |
+
+Defaults were picked to be well above typical same-region latency (a local
+Postgres `SELECT 1` is normally single-digit ms; a Soroban RPC round-trip is
+normally 100-500ms) while still catching genuine slowdowns before they turn
+into timeouts/retries and user-visible errors.
+
+**Secrets hygiene**: dependency `message` fields are redacted before being
+serialized — literal `DATABASE_URL`/`SOROBAN_RPC_URL`/`HORIZON_URL`/
+`PAYMENTS_ADMIN_API_KEY` values and any `scheme://user:pass@host`-shaped
+credential segment are stripped to `[REDACTED]` if a driver or RPC error
+happens to echo them back. See `redactSecrets()` in `backend/src/routes/health.ts`
+and the redaction test in `backend/src/routes/health.test.ts`.
+
 ## Metrics
 
 `GET /metrics` — Prometheus text exposition (enabled when `METRICS_ENABLED=true`, default on in production).
+
+For the complete inventory of every metric, owner, alert threshold, and missing metrics, see [Metrics Inventory](../metrics-inventory.md).
 
 Exposed series:
 
@@ -31,6 +82,14 @@ Exposed series:
 - `splitnaira_process_uptime_seconds`
 - `splitnaira_process_heap_bytes`
 - `splitnaira_info{version="..."}`
+- `projects_created_total` — total projects created
+- `distributions_executed_total` — total distributions executed
+- `deposits_received_total` — total deposits received
+- `sse_connections_active` — active SSE connections
+- `splitnaira_rpc_retry_attempts_total` — total RPC retry attempts (Issue #836)
+- `splitnaira_rpc_retry_max_attempts_reached_total` — times the retry budget was fully consumed without success (Issue #836)
+- `splitnaira_rpc_retry_duration_ms_total` — cumulative sleeper delay between RPC retry attempts in milliseconds (Issue #836)
+- `splitnaira_rpc_retry_outcomes_total{operation,outcome,endpoint}` — final outcome of RPC retry sequences labelled by operation and endpoint (Issue #836)
 
 Contract-level telemetry is also available through on-chain event topics emitted by the SplitNaira contract. Analytics consumers should combine backend metrics with contract event streams for richer Insights.
 
@@ -58,7 +117,10 @@ When `BACKEND_METRICS_URL` is also configured, the smoke check validates the ana
 
 1. Obtain `x-correlation-id` / `requestId` from the client or error response.
 2. Search Render logs or Sentry (when `SENTRY_DSN` is configured).
-3. Check `/health/ready` component breakdown for dependency failures.
+3. Check `/health/ready` component breakdown for dependency failures — note
+   whether the overall `status` is `degraded` (investigate, don't page) or
+   `not_ready` (treat as an outage); see "Degraded-mode readiness contract"
+   above.
 4. Review metrics around the failure window (`splitnaira_validation_failures_total` spikes indicate schema drift).
 
 ## Rollback
@@ -69,8 +131,54 @@ When `BACKEND_METRICS_URL` is also configured, the smoke check validates the ana
 | Smoke check failures | Roll back Render deploy; smoke check does not auto-rollback |
 | Correlation header change | Revert middleware commit; clients using either header remain compatible |
 
+## RPC Retry Observability (Issue #836)
+
+Every call into `executeWithRetry` carries two labels: `operation` (e.g.
+`simulateTransaction`, `getEvents`) and `endpoint` (e.g. `rpc`). The helper
+emits the following structured logs (`LOG_FORMAT=json` recommended for
+ingestion):
+
+| Log | Level | When |
+|-----|-------|------|
+| `RPC retry scheduled` | warn | Each retryable failure before the next attempt |
+| `RPC operation rejected before retrying` | warn | `RequestValidationError` short-circuits the helper |
+| `RPC retries exhausted` | error | Final attempt failed after the full retry budget |
+
+Log fields (stable schema):
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `operation` | string | Short label identifying the RPC call (`simulateTransaction`, `getEvents`, ...) |
+| `endpoint` | string | Host label, defaults to `rpc` |
+| `attempt` | number | 1-based attempt number for this log line |
+| `nextAttempt` | number | The attempt number that will run after the scheduled backoff (omitted for terminal lines) |
+| `maxRetries` | number | The configured retry budget for the call |
+| `delayMs` | number | The backoff that will be slept before the next attempt |
+| `errorKind` | string | The `name` of the captured error class |
+| `errorMessage` | string | Sanitized first-line of the error message (no XDR, no `secret_key=...`, no stack) |
+
+### Alert signals
+
+Recommended Prometheus alerts:
+
+| Signal | Expression | Rationale |
+|--------|-----------|-----------|
+| Retry budget exhausted for any operation | `rate(splitnaira_rpc_retry_max_attempts_reached_total[5m]) > 0` | Burning the full budget means callers will start seeing 502/504 responses |
+| Sustained `simulateTransaction` timeouts | `sum by (endpoint) (rate(splitnaira_rpc_retry_outcomes_total{outcome="timeout"}[5m])) > 0.1` | Simulation latency past `timeoutMs` means RPC is degraded for write paths |
+| Cumulative retry sleep growing without success | `increase(splitnaira_rpc_retry_duration_ms_total[15m]) > 60000` | Backoffs are stacking, suggesting the RPC is flapping |
+| Validation rejections from RPC | `sum by (operation) (rate(splitnaira_rpc_retry_outcomes_total{outcome="validation_error"}[5m])) > 0` | Indicates a client is sending payloads the RPC refuses — usually a contract arg drift |
+
+### Secret-hygiene guarantees
+
+`executeWithRetry` does not log full `Error` objects; it logs only
+`errorKind` and the first line of `errorMessage`. The helper additionally
+scrubs `secret_key` and `xdr=` substrings from the message before logging.
+Reviewers should reject any PR that introduces `console.log(error)` or
+`logger.warn({ error })` in retry paths, because those bypass the sanitizer.
+
 ## Related
 
 - [CI/CD reliability](../cicd-reliability.md)
 - [Backend deploy](../backend-deploy.md)
 - [Ops deployment & rollback](./ops-deployment-rollback.md)
+- [Metrics inventory](../metrics-inventory.md)

@@ -4304,3 +4304,477 @@ fn test_lowered_cap_is_enforced_on_create_project() {
     );
     assert_eq!(result, Err(Ok(SplitError::TooManyCollaborators)));
 }
+
+// ============================================================
+//  COLLABORATOR UPDATE AFTER PAYOUT REGRESSION TESTS (ISSUE #895)
+// ============================================================
+
+#[test]
+fn test_update_collaborators_after_partial_payout() {
+    let (env, _token_admin, token) = create_test_env();
+    let contract_id = env.register_contract(None, SplitNairaContract);
+    let client = SplitNairaContractClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+    let funder = Address::generate(&env);
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    let carol = Address::generate(&env);
+
+    let collabs = make_collaborators(
+        &env,
+        Vec::from_slice(&env, &[alice.clone(), bob.clone()]),
+        Vec::from_slice(&env, &[6000u32, 4000u32]),
+    );
+
+    let project_id = Symbol::new(&env, "partial_payout_update");
+    client.create_project(
+        &owner,
+        &project_id,
+        &String::from_str(&env, "Partial Payout Update"),
+        &String::from_str(&env, "music"),
+        &token,
+        &collabs,
+    );
+
+    deposit_to_project(
+        &env,
+        &client,
+        &token,
+        &project_id,
+        &funder,
+        1_000_0000000i128,
+    );
+
+    client.distribute(&project_id);
+
+    let token_balance = token::Client::new(&env, &token);
+    assert_eq!(token_balance.balance(&alice), 600_0000000i128);
+    assert_eq!(token_balance.balance(&bob), 400_0000000i128);
+    assert_eq!(client.get_balance(&project_id), 0);
+
+    deposit_to_project(
+        &env,
+        &client,
+        &token,
+        &project_id,
+        &funder,
+        500_0000000i128,
+    );
+    assert_eq!(client.get_balance(&project_id), 500_0000000i128);
+
+    let updated_collabs = make_collaborators(
+        &env,
+        Vec::from_slice(&env, &[alice.clone(), bob.clone(), carol.clone()]),
+        Vec::from_slice(&env, &[4000u32, 3000u32, 3000u32]),
+    );
+    client.update_collaborators(&project_id, &owner, &updated_collabs);
+
+    let project = client.get_project(&project_id).unwrap();
+    assert_eq!(project.collaborators.len(), 3);
+    assert_eq!(project.total_distributed, 1_000_0000000i128);
+    assert_eq!(project.distribution_round, 1);
+    assert_eq!(client.get_balance(&project_id), 500_0000000i128);
+
+    client.distribute(&project_id);
+
+    assert_eq!(token_balance.balance(&alice), 600_0000000i128 + 200_0000000i128);
+    assert_eq!(token_balance.balance(&bob), 400_0000000i128 + 150_0000000i128);
+    assert_eq!(token_balance.balance(&carol), 150_0000000i128);
+    assert_eq!(client.get_balance(&project_id), 0);
+
+    let project = client.get_project(&project_id).unwrap();
+    assert_eq!(project.total_distributed, 1_500_0000000i128);
+    assert_eq!(project.distribution_round, 2);
+}
+
+#[test]
+fn test_update_collaborators_after_full_payout() {
+    let (env, _token_admin, token) = create_test_env();
+    let contract_id = env.register_contract(None, SplitNairaContract);
+    let client = SplitNairaContractClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+    let funder = Address::generate(&env);
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    let carol = Address::generate(&env);
+
+    let collabs = make_collaborators(
+        &env,
+        Vec::from_slice(&env, &[alice.clone(), bob.clone()]),
+        Vec::from_slice(&env, &[7000u32, 3000u32]),
+    );
+
+    let project_id = Symbol::new(&env, "full_payout_update");
+    client.create_project(
+        &owner,
+        &project_id,
+        &String::from_str(&env, "Full Payout Update"),
+        &String::from_str(&env, "art"),
+        &token,
+        &collabs,
+    );
+
+    deposit_to_project(
+        &env,
+        &client,
+        &token,
+        &project_id,
+        &funder,
+        2_000_0000000i128,
+    );
+    client.distribute(&project_id);
+
+    assert_eq!(client.get_balance(&project_id), 0);
+    let project = client.get_project(&project_id).unwrap();
+    assert_eq!(project.total_distributed, 2_000_0000000i128);
+    assert_eq!(project.distribution_round, 1);
+
+    let updated_collabs = make_collaborators(
+        &env,
+        Vec::from_slice(&env, &[alice.clone(), bob.clone(), carol.clone()]),
+        Vec::from_slice(&env, &[5000u32, 3000u32, 2000u32]),
+    );
+    client.update_collaborators(&project_id, &owner, &updated_collabs);
+
+    let project = client.get_project(&project_id).unwrap();
+    assert_eq!(project.collaborators.len(), 3);
+    assert_eq!(project.total_distributed, 2_000_0000000i128);
+    assert_eq!(project.distribution_round, 1);
+    assert_eq!(client.get_balance(&project_id), 0);
+
+    deposit_to_project(
+        &env,
+        &client,
+        &token,
+        &project_id,
+        &funder,
+        1_000_0000000i128,
+    );
+    client.distribute(&project_id);
+
+    let token_balance = token::Client::new(&env, &token);
+    assert_eq!(token_balance.balance(&alice), 1_400_0000000i128 + 500_0000000i128);
+    assert_eq!(token_balance.balance(&bob), 600_0000000i128 + 300_0000000i128);
+    assert_eq!(token_balance.balance(&carol), 200_0000000i128);
+
+    let project = client.get_project(&project_id).unwrap();
+    assert_eq!(project.total_distributed, 3_000_0000000i128);
+    assert_eq!(project.distribution_round, 2);
+}
+
+#[test]
+fn test_update_collaborators_preserves_claimed_ledger() {
+    let (env, _token_admin, token) = create_test_env();
+    let contract_id = env.register_contract(None, SplitNairaContract);
+    let client = SplitNairaContractClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+    let funder = Address::generate(&env);
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    let carol = Address::generate(&env);
+
+    let collabs = make_collaborators(
+        &env,
+        Vec::from_slice(&env, &[alice.clone(), bob.clone()]),
+        Vec::from_slice(&env, &[5000u32, 5000u32]),
+    );
+
+    let project_id = Symbol::new(&env, "claimed_ledger_preserve");
+    client.create_project(
+        &owner,
+        &project_id,
+        &String::from_str(&env, "Claimed Ledger Preserve"),
+        &String::from_str(&env, "film"),
+        &token,
+        &collabs,
+    );
+
+    deposit_to_project(
+        &env,
+        &client,
+        &token,
+        &project_id,
+        &funder,
+        1_000_0000000i128,
+    );
+    client.distribute(&project_id);
+
+    assert_eq!(client.get_claimed(&project_id, &alice), 500_0000000i128);
+    assert_eq!(client.get_claimed(&project_id, &bob), 500_0000000i128);
+
+    let updated_collabs = make_collaborators(
+        &env,
+        Vec::from_slice(&env, &[alice.clone(), bob.clone(), carol.clone()]),
+        Vec::from_slice(&env, &[4000u32, 3000u32, 3000u32]),
+    );
+    client.update_collaborators(&project_id, &owner, &updated_collabs);
+
+    assert_eq!(client.get_claimed(&project_id, &alice), 500_0000000i128);
+    assert_eq!(client.get_claimed(&project_id, &bob), 500_0000000i128);
+    assert_eq!(client.get_claimed(&project_id, &carol), 0i128);
+
+    deposit_to_project(
+        &env,
+        &client,
+        &token,
+        &project_id,
+        &funder,
+        1_000_0000000i128,
+    );
+    client.distribute(&project_id);
+
+    assert_eq!(client.get_claimed(&project_id, &alice), 500_0000000i128 + 400_0000000i128);
+    assert_eq!(client.get_claimed(&project_id, &bob), 500_0000000i128 + 300_0000000i128);
+    assert_eq!(client.get_claimed(&project_id, &carol), 300_0000000i128);
+
+    let project = client.get_project(&project_id).unwrap();
+    assert_eq!(project.total_distributed, 2_000_0000000i128);
+    assert_eq!(project.distribution_round, 2);
+}
+
+#[test]
+fn test_update_collaborators_after_payout_requires_owner_auth() {
+    let (env, _token_admin, token) = create_test_env();
+    let contract_id = env.register_contract(None, SplitNairaContract);
+    let client = SplitNairaContractClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+    let funder = Address::generate(&env);
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    let carol = Address::generate(&env);
+    let stranger = Address::generate(&env);
+
+    let collabs = make_collaborators(
+        &env,
+        Vec::from_slice(&env, &[alice.clone(), bob.clone()]),
+        Vec::from_slice(&env, &[6000u32, 4000u32]),
+    );
+
+    let project_id = Symbol::new(&env, "auth_after_payout");
+    client.create_project(
+        &owner,
+        &project_id,
+        &String::from_str(&env, "Auth After Payout"),
+        &String::from_str(&env, "music"),
+        &token,
+        &collabs,
+    );
+
+    deposit_to_project(
+        &env,
+        &client,
+        &token,
+        &project_id,
+        &funder,
+        1_000_0000000i128,
+    );
+    client.distribute(&project_id);
+
+    let updated_collabs = make_collaborators(
+        &env,
+        Vec::from_slice(&env, &[alice.clone(), bob.clone(), carol.clone()]),
+        Vec::from_slice(&env, &[5000u32, 3000u32, 2000u32]),
+    );
+
+    env.mock_auths_clear();
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &stranger,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "update_collaborators",
+            args: (&project_id, &stranger, &updated_collabs).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    let result = client.try_update_collaborators(&project_id, &stranger, &updated_collabs);
+    assert_eq!(result, Err(Ok(SplitError::Unauthorized)));
+}
+
+// ============================================================
+//  COLLABORATOR COUNT BOUNDARY TESTS  (Issue #927)
+//
+//  Covers the full boundary matrix for both create_project and
+//  update_collaborators:
+//    - 0 collaborators  → TooFewCollaborators  (code 5)
+//    - 1 collaborator   → TooFewCollaborators  (code 5)
+//    - DEFAULT_MAX (50) → success
+//    - DEFAULT_MAX + 1  → TooManyCollaborators (code 19)
+//  on both the create and update call paths.
+// ============================================================
+
+/// Helper: generate `n` addresses with equal basis-point splits.
+/// Panics if 10_000 is not divisible by n (use multiples of the divisor).
+fn make_equal_collaborators(env: &Env, n: usize) -> Vec<Collaborator> {
+    assert!(n > 0, "n must be positive");
+    assert!(
+        10_000 % n as u32 == 0,
+        "10_000 must be divisible by n for equal splits"
+    );
+    let bp_each = 10_000u32 / n as u32;
+    let mut addrs = Vec::new(env);
+    let mut bps = Vec::new(env);
+    for _ in 0..n {
+        addrs.push_back(Address::generate(env));
+        bps.push_back(bp_each);
+    }
+    make_collaborators(env, addrs, bps)
+}
+
+#[test]
+fn test_create_project_fails_zero_collaborators() {
+    let (env, _admin, token) = create_test_env();
+    let contract_id = env.register_contract(None, SplitNairaContract);
+    let client = SplitNairaContractClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+    let empty: Vec<Collaborator> = Vec::new(&env);
+
+    let result = client.try_create_project(
+        &owner,
+        &Symbol::new(&env, "zero_collabs"),
+        &String::from_str(&env, "Zero Collabs"),
+        &String::from_str(&env, "music"),
+        &token,
+        &empty,
+    );
+
+    // 0 < minimum of 2 → TooFewCollaborators (error code 5)
+    assert_eq!(result, Err(Ok(SplitError::TooFewCollaborators)));
+}
+
+#[test]
+fn test_create_project_succeeds_at_exactly_maximum_collaborators() {
+    let (env, _admin, token) = create_test_env();
+    let contract_id = env.register_contract(None, SplitNairaContract);
+    let client = SplitNairaContractClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+
+    // DEFAULT_MAX_COLLABORATORS is 50; 10_000 / 50 = 200 bp each.
+    let collabs = make_equal_collaborators(&env, 50);
+
+    client.create_project(
+        &owner,
+        &Symbol::new(&env, "max_collabs"),
+        &String::from_str(&env, "At The Cap"),
+        &String::from_str(&env, "music"),
+        &token,
+        &collabs,
+    );
+
+    let project = client.get_project(&Symbol::new(&env, "max_collabs"));
+    assert_eq!(project.collaborators.len(), 50);
+}
+
+#[test]
+fn test_create_project_fails_at_maximum_plus_one_collaborators() {
+    let (env, _admin, token) = create_test_env();
+    let contract_id = env.register_contract(None, SplitNairaContract);
+    let client = SplitNairaContractClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+
+    // Build 51 collaborators; share won't divide evenly but TooManyCollaborators
+    // is checked before arithmetic, so the split total doesn't matter here.
+    let mut addrs = Vec::new(&env);
+    let mut bps = Vec::new(&env);
+    for i in 0u32..51 {
+        addrs.push_back(Address::generate(&env));
+        bps.push_back(if i == 0 { 10_000u32 } else { 0u32 });
+    }
+    let collabs = make_collaborators(&env, addrs, bps);
+
+    let result = client.try_create_project(
+        &owner,
+        &Symbol::new(&env, "over_cap"),
+        &String::from_str(&env, "Over The Cap"),
+        &String::from_str(&env, "music"),
+        &token,
+        &collabs,
+    );
+
+    // 51 > DEFAULT_MAX_COLLABORATORS (50) → TooManyCollaborators (error code 19)
+    assert_eq!(result, Err(Ok(SplitError::TooManyCollaborators)));
+}
+
+#[test]
+fn test_update_collaborators_succeeds_at_exactly_maximum() {
+    let (env, _admin, token) = create_test_env();
+    let contract_id = env.register_contract(None, SplitNairaContract);
+    let client = SplitNairaContractClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+
+    // Create with 2 collaborators initially.
+    let initial = make_equal_collaborators(&env, 2);
+    client.create_project(
+        &owner,
+        &Symbol::new(&env, "upd_max"),
+        &String::from_str(&env, "Update To Max"),
+        &String::from_str(&env, "music"),
+        &token,
+        &initial,
+    );
+
+    // Update to exactly the maximum (50).
+    let at_max = make_equal_collaborators(&env, 50);
+    client.update_collaborators(
+        &Symbol::new(&env, "upd_max"),
+        &owner,
+        &at_max,
+    );
+
+    let project = client.get_project(&Symbol::new(&env, "upd_max"));
+    assert_eq!(project.collaborators.len(), 50);
+}
+
+#[test]
+fn test_update_collaborators_fails_at_maximum_plus_one() {
+    let (env, _admin, token) = create_test_env();
+    let contract_id = env.register_contract(None, SplitNairaContract);
+    let client = SplitNairaContractClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+
+    // Create with the minimum.
+    let initial = make_equal_collaborators(&env, 2);
+    client.create_project(
+        &owner,
+        &Symbol::new(&env, "upd_over"),
+        &String::from_str(&env, "Update Over Cap"),
+        &String::from_str(&env, "music"),
+        &token,
+        &initial,
+    );
+
+    // Try to update to 51 collaborators.
+    let mut addrs = Vec::new(&env);
+    let mut bps = Vec::new(&env);
+    for i in 0u32..51 {
+        addrs.push_back(Address::generate(&env));
+        bps.push_back(if i == 0 { 10_000u32 } else { 0u32 });
+    }
+    let over_cap = make_collaborators(&env, addrs, bps);
+
+    let result = client.try_update_collaborators(
+        &Symbol::new(&env, "upd_over"),
+        &owner,
+        &over_cap,
+    );
+
+    // TooManyCollaborators is checked before ZeroShare / InvalidSplit.
+    assert_eq!(result, Err(Ok(SplitError::TooManyCollaborators)));
+}
+
+#[test]
+fn test_toomany_collaborators_error_code_is_stable() {
+    // Error codes are part of the on-chain ABI. This test asserts that
+    // TooManyCollaborators stays at code 19 across refactors.
+    assert_eq!(SplitError::TooManyCollaborators.code(), 19);
+    assert_eq!(SplitError::TooFewCollaborators.code(), 5);
+}
