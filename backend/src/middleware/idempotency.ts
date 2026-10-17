@@ -9,6 +9,26 @@ const MAX_KEY_LENGTH = 255;
 const KEY_PATTERN = /^[A-Za-z0-9_.:-]+$/;
 
 /**
+ * Machine-readable outcome of an idempotent request (Issue #1248).
+ *
+ * Clients can branch on `Idempotency-Status` without parsing the error body,
+ * which lets them tell a *duplicate success* (a replay of the original 2xx)
+ * apart from a *conflict* (same key, different payload or an in-flight first
+ * attempt). The raw stored request body is never echoed back.
+ */
+export const IDEMPOTENCY_STATUS_HEADER = "Idempotency-Status";
+export const IDEMPOTENCY_CONFLICT_REASON_HEADER = "Idempotency-Conflict-Reason";
+
+export type IdempotencyOutcome = "stored" | "replayed" | "conflict" | "in_progress";
+
+function setOutcome(res: Response, outcome: IdempotencyOutcome, reason?: string): void {
+  res.setHeader(IDEMPOTENCY_STATUS_HEADER, outcome);
+  if (reason) {
+    res.setHeader(IDEMPOTENCY_CONFLICT_REASON_HEADER, reason);
+  }
+}
+
+/**
  * Deterministic JSON stringify with sorted object keys so two logically
  * identical retries hash the same way even if a client/proxy reorders keys.
  */
@@ -74,6 +94,7 @@ export function idempotencyMiddleware(store: IdempotencyStore = defaultStore): R
     if (existing) {
       if (existing.requestHash !== requestHash) {
         incrementIdempotencyConflicts();
+        setOutcome(res, "conflict", "payload_mismatch");
         next(
           conflictError(
             ErrorCode.IDEMPOTENCY_KEY_CONFLICT,
@@ -85,6 +106,7 @@ export function idempotencyMiddleware(store: IdempotencyStore = defaultStore): R
 
       if (existing.status === "in_progress") {
         incrementIdempotencyConflicts();
+        setOutcome(res, "in_progress", "in_flight");
         next(
           conflictError(
             ErrorCode.IDEMPOTENCY_KEY_IN_PROGRESS,
@@ -95,12 +117,14 @@ export function idempotencyMiddleware(store: IdempotencyStore = defaultStore): R
       }
 
       incrementIdempotencyReplays();
+      setOutcome(res, "replayed");
       res.setHeader("Idempotency-Replayed", "true");
       res.status(existing.statusCode ?? 200).json(existing.body);
       return;
     }
 
     store.markInProgress(scope, key, requestHash);
+    setOutcome(res, "stored");
 
     let settled = false;
     const originalJson = res.json.bind(res);
