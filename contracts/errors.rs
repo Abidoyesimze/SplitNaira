@@ -109,6 +109,15 @@ pub enum SplitError {
     /// Error code `14` is intentionally preserved because it is already
     /// part of the contract's public error-code interface.
     ArithmeticOverflow = 14,
+
+    /// The claimer has already claimed their entitlement for the current
+    /// claim epoch (the period since the last deposit or push distribution).
+    ///
+    /// This prevents a participant from draining a project balance by
+    /// repeatedly claiming against the same entitlement. A new claim becomes
+    /// available once new funds are deposited or a distribution round settles
+    /// the current balance.
+    AlreadyClaimed = 22,
 }
 
 impl SplitError {

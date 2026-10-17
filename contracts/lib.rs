@@ -49,6 +49,10 @@ mod cost_benchmark_tests;
 #[cfg(test)]
 mod deposit_property_tests;
 mod pause_claim_tests;
+#[cfg(test)]
+mod pause_state_transition_tests;
+#[cfg(test)]
+mod duplicate_claim_tests;
 
 use errors::SplitError;
 
@@ -170,6 +174,13 @@ pub enum DataKey {
     /// Admin-configurable per-project collaborator cap.
     /// When unset, the contract falls back to `DEFAULT_MAX_COLLABORATORS`.
     MaxCollaborators,
+    /// Monotonic per-project "claim epoch" counter. Bumped whenever new funds
+    /// become claimable (a `deposit`) or the pending balance is settled by a
+    /// push `distribute`. Used to enforce one claim per collaborator per epoch.
+    ClaimEpoch(Symbol),
+    /// The `ClaimEpoch` value a collaborator last successfully claimed at.
+    /// Presence indicates the collaborator has claimed within the current epoch.
+    LastClaimEpoch(Symbol, Address),
 }
 
 /// Returned by `get_claimable`: how much a collaborator has received and the
@@ -647,6 +658,8 @@ impl SplitNairaContract {
             .set(&DataKey::ProjectBalance(project_id.clone()), &new_balance);
         Self::bump_project_ttl(&env, &project_id);
         Self::adjust_accounted_token_balance(&env, &project.token, amount)?;
+        // New funds open a fresh claim window for every collaborator.
+        Self::bump_claim_epoch(&env, &project_id);
 
         DepositReceived {
             project_id: project_id.clone(),
@@ -765,6 +778,9 @@ if balance < project.collaborators.len() as i128 {
             &remaining_balance,
         );
         Self::adjust_accounted_token_balance(&env, &project.token, -total_sent)?;
+        // Settling the pending balance opens a fresh claim window for the
+        // next round of funds.
+        Self::bump_claim_epoch(&env, &project_id);
 
         project.total_distributed += total_sent;
         project.distribution_round += 1;
@@ -857,6 +873,21 @@ if balance < project.collaborators.len() as i128 {
         }
         let basis_points = claimer_bps.ok_or(SplitError::NotACollaborator)?;
 
+        // Duplicate-claim guard: a collaborator may claim at most once per
+        // claim epoch (see Issue #1254). A new epoch is opened by a deposit or
+        // by a push `distribute`, so an entitlement is only ever claimable a
+        // single time. Rejecting here keeps the failure deterministic and
+        // leaves contract state untouched.
+        let epoch = Self::current_claim_epoch(&env, &project_id);
+        let last_claim_epoch_key = DataKey::LastClaimEpoch(project_id.clone(), claimer.clone());
+        let last_claimed_epoch: Option<u32> = env
+            .storage()
+            .persistent()
+            .get::<DataKey, u32>(&last_claim_epoch_key);
+        if last_claimed_epoch == Some(epoch) {
+            return Err(SplitError::AlreadyClaimed);
+        }
+
         let balance: i128 = env
             .storage()
             .persistent()
@@ -902,6 +933,13 @@ if balance < project.collaborators.len() as i128 {
             &amount,
         );
         Self::bump_claimed_ttl(&env, &project_id, &claimer);
+
+        // Record that this collaborator has claimed within the current epoch so
+        // an immediate re-claim of the same entitlement is rejected.
+        env.storage().persistent().set(
+            &DataKey::LastClaimEpoch(project_id.clone(), claimer.clone()),
+            &epoch,
+        );
 
         // Transfer tokens to claimer
         let token_client = token::Client::new(&env, &project.token);
@@ -1415,6 +1453,37 @@ if balance < project.collaborators.len() as i128 {
                 PROJECT_TTL_BUMP_LEDGERS,
             );
         }
+        let last_epoch_key = DataKey::LastClaimEpoch(project_id.clone(), collaborator.clone());
+        if env.storage().persistent().has(&last_epoch_key) {
+            env.storage().persistent().extend_ttl(
+                &last_epoch_key,
+                PROJECT_TTL_THRESHOLD_LEDGERS,
+                PROJECT_TTL_BUMP_LEDGERS,
+            );
+        }
+    }
+
+    /// Reads the current claim epoch for a project (0 when never bumped).
+    fn current_claim_epoch(env: &Env, project_id: &Symbol) -> u32 {
+        env.storage()
+            .persistent()
+            .get::<DataKey, u32>(&DataKey::ClaimEpoch(project_id.clone()))
+            .unwrap_or(0)
+    }
+
+    /// Advances the project's claim epoch, opening a fresh claim window for
+    /// every collaborator. Called whenever new funds arrive (`deposit`) or the
+    /// pending balance is settled by a push `distribute`.
+    fn bump_claim_epoch(env: &Env, project_id: &Symbol) {
+        let current = Self::current_claim_epoch(env, project_id);
+        let next = current.saturating_add(1);
+        let key = DataKey::ClaimEpoch(project_id.clone());
+        env.storage().persistent().set(&key, &next);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PROJECT_TTL_THRESHOLD_LEDGERS,
+            PROJECT_TTL_BUMP_LEDGERS,
+        );
     }
 
     fn require_contract_admin(env: &Env, admin: &Address) -> Result<(), SplitError> {
